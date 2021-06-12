@@ -1,0 +1,336 @@
+import os
+import random
+import sys
+import glob 
+import json
+import keras
+import IPython.display as ipd
+import librosa
+import librosa.display
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import plotly.graph_objs as go
+import plotly.offline as py
+import plotly.tools as tls
+import seaborn as sns
+import scipy.io.wavfile
+import tensorflow as tf
+from keras import regularizers
+from keras.callbacks import ModelCheckpoint, LearningRateScheduler, EarlyStopping
+from keras.callbacks import  History, ReduceLROnPlateau, CSVLogger
+from keras.models import Model, Sequential
+from keras.models import model_from_json
+from keras.models import load_model
+from keras.layers import Dense, Embedding, LSTM
+from keras.layers import Input, Flatten, Dropout, Activation, BatchNormalization
+from keras.layers import Conv1D, MaxPooling1D, AveragePooling1D
+from keras.preprocessing import sequence
+from keras.preprocessing.sequence import pad_sequences
+from keras.preprocessing.text import Tokenizer
+from keras.utils import np_utils
+from keras.utils.np_utils import to_categorical
+from sklearn.metrics import confusion_matrix
+from sklearn.preprocessing import LabelEncoder
+from scipy.fftpack import fft # 離散傅立葉變換 - 返回實數或複數序列
+from scipy import signal
+from scipy.io import wavfile
+from tqdm import tqdm
+from sklearn.model_selection import StratifiedShuffleSplit
+from keras import backend as K
+import xlrd
+
+def precision(y_true, y_pred):
+    true_positives = K.sum(K.round(K.clip(y_true * y_pred, 0, 1)))
+    predicted_positives = K.sum(K.round(K.clip(y_pred, 0, 1)))
+    precision = true_positives / (predicted_positives + K.epsilon())
+    return precision
+
+
+def recall(y_true, y_pred):
+    true_positives = K.sum(K.round(K.clip(y_true * y_pred, 0, 1)))
+    possible_positives = K.sum(K.round(K.clip(y_true, 0, 1)))
+    recall = true_positives / (possible_positives + K.epsilon())
+    return recall
+
+
+def fscore(y_true, y_pred):
+    if K.sum(K.round(K.clip(y_true, 0, 1))) == 0:
+        return 0
+
+    p = precision(y_true, y_pred)
+    r = recall(y_true, y_pred)
+    f_score = 2 * (p * r) / (p + r + K.epsilon())
+    return f_score
+
+def get_lr_metric(optimizer):
+    def lr(y_true, y_pred):
+        return optimizer.lr
+    return lr
+    
+#数据扩充
+def plot_time_series(data):
+    """
+    Plot the Audio Frequency.
+    """
+    fig = plt.figure(figsize=(14, 8))
+    plt.title('Raw wave ')
+    plt.ylabel('Amplitude')
+    plt.plot(np.linspace(0, 1, len(data)), data)
+    plt.show()
+
+
+def noise(data):
+    """
+    Adding White Noise.
+    """
+    # you can take any distribution from https://docs.scipy.org/doc/numpy-1.13.0/reference/routines.random.html
+    noise_amp = 0.005*np.random.uniform()*np.amax(data)
+    data = data.astype('float64') + noise_amp * np.random.normal(size=data.shape[0])
+    return data
+    
+def shift(data):
+    """
+    Random Shifting.
+    """
+    s_range = int(np.random.uniform(low=-5, high = 5)*500)
+    return np.roll(data, s_range)
+    
+def stretch(data, rate=0.8):
+    """
+    Streching the Sound.
+    """
+    data = librosa.effects.time_stretch(data, rate)
+    return data
+    
+def pitch(data, sample_rate):
+    """
+    Pitch Tuning.
+    """
+    bins_per_octave = 12
+    pitch_pm = 2
+    pitch_change =  pitch_pm * 2*(np.random.uniform())   
+    data = librosa.effects.pitch_shift(data.astype('float64'), 
+                                      sample_rate, n_steps=pitch_change, 
+                                      bins_per_octave=bins_per_octave)
+    return data
+    
+def dyn_change(data):
+    """
+    Random Value Change.
+    """
+    dyn_change = np.random.uniform(low=1.5,high=3)
+    return (data * dyn_change)
+    
+def speedNpitch(data):
+    """
+    peed and Pitch Tuning.
+    """
+    # you can change low and high here
+    length_change = np.random.uniform(low=0.8, high = 1)
+    speed_fac = 1.0  / length_change
+    tmp = np.interp(np.arange(0,len(data),speed_fac),np.arange(0,len(data)),data)
+    minlen = min(data.shape[0], tmp.shape[0])
+    data *= 0
+    data[0:minlen] = tmp[0:minlen]
+    return data
+
+input_duration=3
+dir_list = os.listdir('data/')
+train_dir_list= os.listdir('traindata/')
+print(train_dir_list)
+
+
+
+#读取原始数据
+data_df = pd.DataFrame(columns=['path', 'source', 'actor', 'gender',
+                                'intensity', 'statement', 'repetition', 'emotion'])
+                                
+                                
+wb = xlrd.open_workbook('礼貌度评分.xlsx')
+sh = wb.sheet_by_name('工作表1')
+spencer_dit,lisa_dit,apryl_dit,adam_dit={},{},{},{}
+print(type(sh.col_values(0)))
+for i in range(1,len(sh.col_values(0))):
+    spencer_dit[sh.col_values(0)[i]] =int(sh.col_values(1)[i])
+    lisa_dit[sh.col_values(0)[i]] =int(sh.col_values(2)[i])
+    apryl_dit[sh.col_values(0)[i]] =int(sh.col_values(3)[i])
+    adam_dit[sh.col_values(0)[i]] =int(sh.col_values(4)[i])                        
+count = 0
+train_data_df=pd.DataFrame(columns=['path', 'emotion'])
+for i in train_dir_list:
+    file_list = os.listdir('traindata/' + i)
+    for f in file_list:
+        path = 'traindata/' + i + '/' + f
+        if  i== "Adam":
+            emotion =  adam_dit[f.split('.')[0]]
+        elif  i== "Apryl":
+            emotion =  apryl_dit[f.split('.')[0]]
+        elif  i== "Lisa":
+            emotion =  lisa_dit[f.split('.')[0]]
+        elif  i== "Spencer":
+            emotion =  spencer_dit[f.split('.')[0]]
+        train_data_df.loc[count] = [path, emotion]
+        count += 1    
+print(train_data_df)
+
+
+
+
+
+data = pd.DataFrame(columns=['feature'])
+for i in tqdm(range(len(train_data_df))):
+    print(train_data_df.path[i])
+    X, sample_rate = librosa.load(train_data_df.path[i], res_type='kaiser_fast',duration=input_duration,sr=22050*2,offset=0.5)
+#     X = X[10000:90000]
+    sample_rate = np.array(sample_rate)
+    mfccs = np.mean(librosa.feature.mfcc(y=X, sr=sample_rate, n_mfcc=13), axis=0)
+    feature = mfccs
+    data.loc[i] = [feature]    
+df3 = pd.DataFrame(data['feature'].values.tolist())
+labels = train_data_df.emotion
+newdf = pd.concat([df3,labels], axis=1)
+rnewdf = newdf.rename(index=str, columns={"0": "label"})
+rnewdf = rnewdf.fillna(0)
+
+
+
+syn_data1 = pd.DataFrame(columns=['feature', 'label'])
+syn_data2 = pd.DataFrame(columns=['feature', 'label'])
+
+for i in tqdm(range(len(train_data_df))):
+    X, sample_rate = librosa.load(train_data_df.path[i], res_type='kaiser_fast',duration=input_duration,sr=22050*2,offset=0.5)
+    if train_data_df.emotion[i]:
+#     if data2_df.label[i] == "male_positive":
+        X = noise(X)
+        sample_rate = np.array(sample_rate)
+        mfccs = np.mean(librosa.feature.mfcc(y=X, sr=sample_rate, n_mfcc=13), axis=0)
+        feature = mfccs
+        a = random.uniform(0, 1)
+        syn_data1.loc[i] = [feature, train_data_df.emotion[i]]
+
+for i in tqdm(range(len(train_data_df))):
+    X, sample_rate = librosa.load(train_data_df.path[i], res_type='kaiser_fast',duration=input_duration,sr=22050*2,offset=0.5)
+    if train_data_df.emotion[i]:
+#     if data2_df.label[i] == "male_positive":
+        X = pitch(X, sample_rate)
+        sample_rate = np.array(sample_rate)
+        mfccs = np.mean(librosa.feature.mfcc(y=X, sr=sample_rate, n_mfcc=13), axis=0)
+        feature = mfccs
+        a = random.uniform(0, 1)
+        syn_data2.loc[i] = [feature, train_data_df.emotion[i]]
+
+#将提取的数据转换为合适的格式
+
+syn_data1 = syn_data1.reset_index(drop=True)
+syn_data2 = syn_data2.reset_index(drop=True)
+df4 = pd.DataFrame(syn_data1['feature'].values.tolist())
+labels4 = syn_data1.label
+syndf1 = pd.concat([df4,labels4], axis=1)
+syndf1 = syndf1.rename(index=str, columns={"0": "label"})
+syndf1 = syndf1.fillna(0)
+df4 = pd.DataFrame(syn_data2['feature'].values.tolist())
+labels4 = syn_data2.label
+syndf2 = pd.concat([df4,labels4], axis=1)
+syndf2 = syndf2.rename(index=str, columns={"0": "label"})
+syndf2 = syndf2.fillna(0)
+
+#将增强数据与原本数据结合在一起
+combined_df = pd.concat([rnewdf, syndf1, syndf2], ignore_index=True)
+combined_df = combined_df.fillna(0)
+
+#将数据拆分为训练集数据集
+
+X = combined_df.drop(['label'], axis=1)
+y = combined_df.label
+xxx = StratifiedShuffleSplit(1, test_size=0.2, random_state=12)
+for train_index, test_index in xxx.split(X, y):
+    X_train, X_test = X.iloc[train_index], X.iloc[test_index]
+    y_train, y_test = y.iloc[train_index], y.iloc[test_index]
+X_train = np.array(X_train)
+y_train = np.array(y_train)
+X_test = np.array(X_test)
+y_test = np.array(y_test)
+lb = LabelEncoder()
+y_train = np_utils.to_categorical(lb.fit_transform(y_train))
+y_test = np_utils.to_categorical(lb.fit_transform(y_test))
+x_traincnn = np.expand_dims(X_train, axis=2)
+x_testcnn = np.expand_dims(X_test, axis=2)
+
+print("x_traincnn:",x_traincnn.shape)
+print("x_testcnn:",x_testcnn.shape)
+
+
+    
+   
+model = Sequential()
+model.add(Conv1D(256, 8, padding='same',input_shape=(X_train.shape[1],1)))
+model.add(Activation('relu'))
+model.add(Conv1D(256, 8, padding='same'))
+model.add(BatchNormalization())
+model.add(Activation('relu'))
+model.add(Dropout(0.25))
+model.add(MaxPooling1D(pool_size=(8)))
+model.add(Conv1D(128, 8, padding='same'))
+model.add(Activation('relu'))
+model.add(Conv1D(128, 8, padding='same'))
+model.add(Activation('relu'))
+model.add(Conv1D(128, 8, padding='same'))
+model.add(Activation('relu'))
+model.add(Conv1D(128, 8, padding='same'))
+model.add(BatchNormalization())
+model.add(Activation('relu'))
+model.add(Dropout(0.25))
+model.add(MaxPooling1D(pool_size=(8)))
+model.add(Conv1D(64, 8, padding='same'))
+model.add(Activation('relu'))
+model.add(Conv1D(64, 8, padding='same'))
+model.add(Activation('relu'))
+model.add(Flatten())
+
+
+# 根據目標類別編號進行編輯修改　－ according to target class no.
+
+model.add(Dense(6))
+model.add(Activation('softmax'))
+opt = keras.optimizers.SGD(lr=0.0001, momentum=0.0, decay=0.0, nesterov=False)
+
+
+print(model.summary())
+model.compile(loss='categorical_crossentropy', optimizer=opt, metrics=['accuracy', fscore])
+lr_reduce = ReduceLROnPlateau(monitor='val_loss', factor=0.9, patience=20, min_lr=0.000001)
+
+
+mcp_save = ModelCheckpoint('model/CNN1D_OPENSMILE_IS10test.h5', save_best_only=True, monitor='val_loss', mode='min')
+cnnhistory=model.fit(x_traincnn, y_train, batch_size=16, epochs=700,
+                     validation_data=(x_testcnn, y_test), callbacks=[mcp_save, lr_reduce])
+model.save("mymodeltest.h5")
+plt.plot(cnnhistory.history['loss'])
+plt.plot(cnnhistory.history['val_loss'])
+plt.title('model loss')
+plt.ylabel('loss')
+plt.xlabel('epoch')
+plt.legend(['train', 'test'], loc='upper left')
+plt.show()  
+
+
+model_json = model.to_json()
+with open("modeltest.json", "w") as json_file:
+    json_file.write(model_json) 
+    
+
+json_file = open('modeltest.json', 'r')
+loaded_model_json = json_file.read()
+json_file.close()
+loaded_model = model_from_json(loaded_model_json)
+
+# 加載 weights 到新模型中 
+
+loaded_model.load_weights("model/CNN1D_OPENSMILE_IS10test.h5")
+print("Loaded model from disk")
+ 
+# evaluate 根據測試數據 test data 評估 加載的模型  
+
+loaded_model.compile(loss='categorical_crossentropy', optimizer=opt, metrics=['accuracy'])
+score = loaded_model.evaluate(x_testcnn, y_test, verbose=0)
+print("%s: %.2f%%" % (loaded_model.metrics_names[1], score[1]*100))    
